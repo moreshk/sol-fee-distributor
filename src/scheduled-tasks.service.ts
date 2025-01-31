@@ -45,7 +45,7 @@ export class ScheduledTasksService {
 
     // Initialize Solana connection
     this.connection = new Connection(
-      'https://api.mainnet-beta.solana.com',
+      'https://mainnet.helius-rpc.com/?api-key=1bd7151b-2c57-45f5-8172-b32538120d8e',
       'confirmed',
     );
 
@@ -74,58 +74,105 @@ export class ScheduledTasksService {
     distributions: { recipient: string; amount: number }[],
   ) {
     const BATCH_SIZE = 10;
-    const FEE_ADJUSTMENT = 0.99; // Send 99% of amount to account for gas
+    const FEE_ADJUSTMENT = 0.99;
+    const MAX_RETRIES = 3;
+    const RETRY_DELAY = 2000;
+    const MIN_AMOUNT_THRESHOLD = 0.001; // 0.001 SOL minimum to avoid rent issues
 
-    for (let i = 0; i < distributions.length; i += BATCH_SIZE) {
-      const batch = distributions.slice(i, i + BATCH_SIZE);
-      const transaction = new Transaction();
+    // Filter out distributions below minimum threshold
+    const validDistributions = distributions.filter(
+      (dist) => dist.amount >= MIN_AMOUNT_THRESHOLD,
+    );
 
-      for (const dist of batch) {
-        const adjustedAmount = Math.floor(
-          dist.amount * LAMPORTS_PER_SOL * FEE_ADJUSTMENT,
-        );
+    if (validDistributions.length === 0) {
+      this.logger.log('No distributions above minimum threshold');
+      return;
+    }
 
-        transaction.add(
-          SystemProgram.transfer({
-            fromPubkey: this.feeMasterKeypair.publicKey,
-            toPubkey: new PublicKey(dist.recipient),
-            lamports: adjustedAmount,
-          }),
-        );
-      }
+    for (let i = 0; i < validDistributions.length; i += BATCH_SIZE) {
+      const batch = validDistributions.slice(i, i + BATCH_SIZE);
+      let retryCount = 0;
+      let success = false;
 
-      try {
-        const latestBlockhash = await this.connection.getLatestBlockhash();
-        transaction.recentBlockhash = latestBlockhash.blockhash;
-        transaction.feePayer = this.feeMasterKeypair.publicKey;
+      while (!success && retryCount < MAX_RETRIES) {
+        const transaction = new Transaction();
 
-        const signature = await this.connection.sendTransaction(transaction, [
-          this.feeMasterKeypair,
-        ]);
-
-        // Wait for confirmation
-        const confirmation = await this.connection.confirmTransaction({
-          signature,
-          blockhash: latestBlockhash.blockhash,
-          lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
-        });
-
-        if (confirmation.value.err) {
-          throw new Error(`Transaction failed: ${confirmation.value.err}`);
-        }
-
-        this.logger.log(`Batch transaction successful: ${signature}`);
-
-        // Insert distribution records
         for (const dist of batch) {
-          await this.pool.query(
-            'INSERT INTO fee_distributions (receiver_address, transaction_hash, amount) VALUES ($1, $2, $3)',
-            [dist.recipient, signature, dist.amount],
+          const adjustedAmount = Math.floor(
+            dist.amount * LAMPORTS_PER_SOL * FEE_ADJUSTMENT,
+          );
+
+          transaction.add(
+            SystemProgram.transfer({
+              fromPubkey: this.feeMasterKeypair.publicKey,
+              toPubkey: new PublicKey(dist.recipient),
+              lamports: adjustedAmount,
+            }),
           );
         }
-      } catch (error) {
-        this.logger.error(`Failed to process batch: ${error.message}`);
-        throw error;
+
+        try {
+          const latestBlockhash = await this.connection.getLatestBlockhash();
+          transaction.recentBlockhash = latestBlockhash.blockhash;
+          transaction.feePayer = this.feeMasterKeypair.publicKey;
+
+          const signature = await this.connection.sendTransaction(transaction, [
+            this.feeMasterKeypair,
+          ]);
+
+          // Wait for confirmation
+          const confirmation = await this.connection.confirmTransaction({
+            signature,
+            blockhash: latestBlockhash.blockhash,
+            lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
+          });
+
+          if (confirmation.value.err) {
+            throw new Error(`Transaction failed: ${confirmation.value.err}`);
+          }
+
+          this.logger.log(`Batch transaction successful: ${signature}`);
+
+          // Insert distribution records within a transaction
+          const client = await this.pool.connect();
+          try {
+            await client.query('BEGIN');
+
+            for (const dist of batch) {
+              await client.query(
+                'INSERT INTO fee_distributions (receiver_address, transaction_hash, amount) VALUES ($1, $2, $3)',
+                [dist.recipient, signature, dist.amount],
+              );
+
+              // Update user's fees_claimed_so_far
+              await client.query(
+                'UPDATE users SET fees_claimed_so_far = fees_claimed_so_far + $1 WHERE wallet_address = $2',
+                [dist.amount, dist.recipient],
+              );
+            }
+
+            await client.query('COMMIT');
+            success = true;
+          } catch (dbError) {
+            await client.query('ROLLBACK');
+            throw dbError;
+          } finally {
+            client.release();
+          }
+        } catch (error) {
+          retryCount++;
+          if (retryCount < MAX_RETRIES) {
+            this.logger.warn(
+              `Failed to process batch (attempt ${retryCount}/${MAX_RETRIES}): ${error.message}`,
+            );
+            await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY));
+          } else {
+            this.logger.error(
+              `Failed to process batch after ${MAX_RETRIES} attempts: ${error.message}`,
+            );
+            throw error;
+          }
+        }
       }
     }
   }
@@ -148,13 +195,20 @@ export class ScheduledTasksService {
         this.logger.log('No transactions processed yet');
       }
 
-      // Get summed sol quantity for each creator wallet address
+      // Modify the query to accumulate amounts until they reach the minimum threshold
       const query = `
-        SELECT c.creator_wallet_address, SUM(t.sol_quantity) as total_sol
-        FROM transactions t
-        JOIN coins c ON t.coin_id = c.mint_address
-        WHERE t.id > $1
-        GROUP BY c.creator_wallet_address
+        WITH accumulated_fees AS (
+          SELECT 
+            c.creator_wallet_address,
+            SUM(t.sol_quantity * 0.002) as total_sol
+          FROM transactions t
+          JOIN coins c ON t.coin_id = c.mint_address
+          WHERE t.id > $1
+          GROUP BY c.creator_wallet_address
+          HAVING SUM(t.sol_quantity * 0.002) >= 0.001  -- Only include amounts >= 0.001 SOL
+        )
+        SELECT creator_wallet_address, total_sol
+        FROM accumulated_fees
       `;
       const params = [maxTransactionId || 0];
       const result = await client.query(query, params);
